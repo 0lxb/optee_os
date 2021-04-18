@@ -33,39 +33,45 @@ static struct itr_handler tzc_itr_handler = {
 };
 DECLARE_KEEP_PAGER(tzc_itr_handler);
 
-static bool tzc_region_is_non_secure(unsigned int i, vaddr_t base, size_t size)
+static bool tzc_find_region(vaddr_t base, size_t size, struct tzc_region_config *region_cfg)
+{
+	uint8_t i = 1;
+
+	while (true) {
+		if (tzc_get_region_config(i++, region_cfg) != TEE_SUCCESS)
+			return false;
+
+		if (region_cfg->base <= base && region_cfg->top >= (base + size - 1))
+			return true;
+	}
+}
+
+static bool tzc_region_is_non_secure(vaddr_t base, size_t size)
 {
 	struct tzc_region_config region_cfg = { };
 	uint32_t ns_cpu_mask = TZC_REGION_ACCESS_RDWR(STM32MP1_TZC_A7_ID);
 	uint32_t filters_mask = GENMASK_32(1, 0);
 
-	if (tzc_get_region_config(i, &region_cfg))
-		panic();
-
-	return region_cfg.base == base && region_cfg.top == (base + size - 1) &&
-	       region_cfg.sec_attr == TZC_REGION_S_NONE &&
-	       (region_cfg.ns_device_access & ns_cpu_mask) == ns_cpu_mask &&
-	       region_cfg.filters == filters_mask;
+	return tzc_find_region(base, size, &region_cfg) && 
+		region_cfg.sec_attr == TZC_REGION_S_NONE &&
+		(region_cfg.ns_device_access & ns_cpu_mask) == ns_cpu_mask &&
+		region_cfg.filters == filters_mask;
 }
 
-static bool tzc_region_is_secure(unsigned int i, vaddr_t base, size_t size)
+static bool tzc_region_is_secure(vaddr_t base, size_t size)
 {
 	struct tzc_region_config region_cfg = { };
 	uint32_t filters_mask = GENMASK_32(1, 0);
 
-	if (tzc_get_region_config(i, &region_cfg))
-		panic();
-
-	return region_cfg.base == base && region_cfg.top == (base + size - 1) &&
-	       region_cfg.sec_attr == TZC_REGION_S_RDWR &&
-	       region_cfg.ns_device_access == 0 &&
-	       region_cfg.filters == filters_mask;
+	return tzc_find_region(base, size, &region_cfg) &&
+		region_cfg.sec_attr == TZC_REGION_S_RDWR &&
+		region_cfg.ns_device_access == 0 &&
+		region_cfg.filters == filters_mask;
 }
 
 static TEE_Result init_stm32mp1_tzc(void)
 {
 	void *base = phys_to_virt(TZC_BASE, MEM_AREA_IO_SEC);
-	unsigned int region_index = 1;
 	const uint64_t dram_start = DDR_BASE;
 	const uint64_t dram_end = dram_start + CFG_DRAM_SIZE;
 	const uint64_t tzdram_start = CFG_TZDRAM_START;
@@ -83,21 +89,15 @@ static TEE_Result init_stm32mp1_tzc(void)
 	 * expectations.
 	 */
 	if (dram_start < tzdram_start) {
-		if (!tzc_region_is_non_secure(region_index, dram_start,
-					      tzdram_start - dram_start))
+		if (!tzc_region_is_non_secure(dram_start, tzdram_start - dram_start))
 			panic("Unexpected TZC area on non-secure region");
-
-		region_index++;
 	}
 
-	if (!tzc_region_is_secure(region_index, tzdram_start, tzdram_size))
+	if (!tzc_region_is_secure(tzdram_start, tzdram_size))
 		panic("Unexpected TZC configuration on secure region");
 
 	if (tzdram_end < dram_end) {
-		region_index++;
-
-		if (!tzc_region_is_non_secure(region_index, tzdram_end,
-					      dram_end - tzdram_end))
+		if (!tzc_region_is_non_secure(tzdram_end, dram_end - tzdram_end))
 			panic("Unexpected TZC area on non-secure region");
 	}
 

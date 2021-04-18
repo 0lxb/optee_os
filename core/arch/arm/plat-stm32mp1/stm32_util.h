@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /*
- * Copyright (c) 2018-2019, STMicroelectronics
+ * Copyright (c) 2018-2020, STMicroelectronics
  */
 
 #ifndef __STM32_UTIL_H__
@@ -9,11 +9,23 @@
 #include <assert.h>
 #include <drivers/stm32_bsec.h>
 #include <kernel/panic.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <types_ext.h>
 
+/* SoC versioning and device ID */
+TEE_Result stm32mp1_dbgmcu_get_chip_version(uint32_t *chip_version);
+TEE_Result stm32mp1_dbgmcu_get_chip_dev_id(uint32_t *chip_dev_id);
+
+/* OPP service */
+bool stm32mp_supports_cpu_opp(uint32_t opp_id);
+
 /* Backup registers and RAM utils */
 vaddr_t stm32mp_bkpreg(unsigned int idx);
+vaddr_t stm32mp_bkpsram_base(void);
+
+/* Platform util for the STGEN driver */
+vaddr_t stm32mp_stgen_base(void);
 
 /*
  * SYSCFG IO compensation.
@@ -25,6 +37,7 @@ void stm32mp_syscfg_disable_io_compensation(void);
 /* Platform util for the GIC */
 vaddr_t get_gicc_base(void);
 vaddr_t get_gicd_base(void);
+void stm32mp_gic_set_end_of_interrupt(uint32_t it);
 
 /*
  * Platform util functions for the GPIO driver
@@ -42,6 +55,18 @@ vaddr_t get_gicd_base(void);
 vaddr_t stm32_get_gpio_bank_base(unsigned int bank);
 unsigned int stm32_get_gpio_bank_offset(unsigned int bank);
 unsigned int stm32_get_gpio_bank_clock(unsigned int bank);
+
+/*
+ * Platform util for the IWDG driver
+ */
+
+/* Get IWDG_* enable flags mask from watchdog configuration read from fuses */
+unsigned long stm32_get_iwdg_otp_config(vaddr_t pbase);
+
+/* Conversion between IWDG instance IDs and hardware resources */
+size_t stm32mp_iwdg_instance2irq(unsigned int instance);
+unsigned int stm32mp_iwdg_irq2instance(size_t irq);
+unsigned int stm32mp_iwdg_iomem2instance(vaddr_t pbase);
 
 /* Platform util for PMIC support */
 bool stm32mp_with_pmic(void);
@@ -62,15 +87,6 @@ static inline void stm32mp_register_online_cpu(void)
 uint32_t may_spin_lock(unsigned int *lock);
 void may_spin_unlock(unsigned int *lock, uint32_t exceptions);
 
-/*
- * Util for clock gating and to get clock rate for stm32 and platform drivers
- * @id: Target clock ID, ID used in clock DT bindings
- */
-void stm32_clock_enable(unsigned long id);
-void stm32_clock_disable(unsigned long id);
-unsigned long stm32_clock_get_rate(unsigned long id);
-bool stm32_clock_is_enabled(unsigned long id);
-
 /* Return true if @clock_id is shared by secure and non-secure worlds */
 bool stm32mp_nsec_can_access_clock(unsigned long clock_id);
 
@@ -83,6 +99,22 @@ static inline bool stm32mp_nsec_can_access_pmic_regu(const char *name __unused)
 	return false;
 }
 #endif
+
+/* PM sequences specific to SoC STOP mode support */
+void stm32mp1_clk_save_context_for_stop(void);
+void stm32mp1_clk_restore_context_for_stop(void);
+
+/* Protect the MCU clock subsytem */
+void stm32mp1_clk_mcuss_protect(bool enable);
+
+/*
+ * Util for PLL1 settings management based on DT OPP table content.
+ */
+int stm32mp1_clk_compute_all_pll1_settings(uint32_t buck1_voltage);
+void stm32mp1_clk_lp_save_opp_pll1_settings(uint8_t *data, size_t size);
+bool stm32mp1_clk_pll1_settings_are_valid(void);
+int stm32mp1_set_opp_khz(uint32_t freq_khz);
+int stm32mp1_round_opp_khz(uint32_t *freq_khz);
 
 /*
  * Util for reset signal assertion/desassertion for stm32 and platform drivers
@@ -122,6 +154,27 @@ struct stm32_bsec_static_cfg {
 };
 
 void stm32mp_get_bsec_static_cfg(struct stm32_bsec_static_cfg *cfg);
+
+/* Reset function for early watchdog management */
+void stm32mp_platform_reset(int cpu);
+
+/* Clock calibration. Returns 0 on success */
+#ifdef CFG_STM32_CLKCALIB
+int stm32mp_start_clock_calib(unsigned int clock_id);
+#else
+static inline int stm32mp_start_clock_calib(unsigned int clock_id __unused)
+{
+	return 1;
+}
+#endif
+
+/* Platform util for the RTC driver */
+bool stm32_rtc_get_read_twice(void);
+
+/* Platform util for the ETZPC driver */
+
+/* Convert a ETZPC mode from DT binding to ETZPC DECPROT configuration */
+enum etzpc_decprot_attributes stm32mp_etzpc_binding2decprot(uint32_t mode);
 
 /*
  * Return true if platform is in closed_device mode
@@ -293,5 +346,9 @@ bool stm32mp_gpio_bank_is_non_secure(unsigned int bank);
 
 /* Register parent clocks of @clock (ID used in clock DT bindings) as secure */
 void stm32mp_register_clock_parents_secure(unsigned long clock_id);
+
+/* Register a resource identified by a ETZPC DECPROT identifier */
+void stm32mp_register_etzpc_decprot(unsigned int id,
+				    enum etzpc_decprot_attributes attr);
 
 #endif /*__STM32_UTIL_H__*/

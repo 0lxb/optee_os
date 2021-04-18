@@ -306,6 +306,9 @@ $(eval $(call cfg-depends-all,CFG_REE_FS_TA_BUFFERED,CFG_REE_FS_TA))
 # in-tree TAs. CFG_IN_TREE_EARLY_TAS is formatted as:
 # <name-of-ta>/<uuid>
 # for instance avb/023f8f1a-292a-432b-8fc4-de8471358067
+#
+# By default the early TAs are compressed in the TEE binary, it is possible to
+# not compress them with CFG_EARLY_TA_COMPRESS=n
 ifneq ($(EARLY_TA_PATHS)$(CFG_IN_TREE_EARLY_TAS),)
 $(call force,CFG_EARLY_TA,y)
 $(call force,CFG_EMBEDDED_TS,y)
@@ -323,6 +326,7 @@ endif
 ifeq ($(CFG_EMBEDDED_TS),y)
 $(call force,CFG_ZLIB,y)
 endif
+CFG_EARLY_TA_COMPRESS ?= y
 
 # Enable paging, requires SRAM, can't be enabled by default
 CFG_WITH_PAGER ?= n

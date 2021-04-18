@@ -1,5 +1,6 @@
 include core/arch/arm/kernel/link.mk
 
+ifeq ($(CFG_STM32MP15x_STM32IMAGE),y)
 # Create stm32 formatted images from the native binary images
 
 define stm32image_cmd
@@ -22,3 +23,4 @@ all: $(link-out-dir)/tee-pageable_v2.stm32
 cleanfiles += $(link-out-dir)/tee-pageable_v2.stm32
 $(link-out-dir)/tee-pageable_v2.stm32: $(link-out-dir)/tee-pageable_v2.bin
 	$(stm32image_cmd) --source $< --dest $@ --bintype 0x22
+endif

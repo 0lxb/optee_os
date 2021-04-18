@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 /*
- * Copyright (c) 2017-2020, STMicroelectronics
+ * Copyright (c) 2017-2021, STMicroelectronics
  */
 
 #include <drivers/stm32_i2c.h>
@@ -36,6 +36,8 @@ static uint32_t pmic_i2c_addr;
 
 /* CPU voltage supplier if found */
 static char cpu_supply_name[PMIC_REGU_SUPPLY_NAME_LEN];
+/* USB voltage supplier if found */
+static char *usb_supply_name;
 
 bool stm32mp_with_pmic(void)
 {
@@ -372,6 +374,49 @@ const char *stm32mp_pmic_get_cpu_supply_name(void)
 	return cpu_supply_name;
 }
 
+/* Return a libfdt compliant status value */
+static int save_usb_supply_name(void)
+{
+	void *fdt = NULL;
+	int node = 0;
+	int subnode = 0;
+	const fdt32_t *cuint = NULL;
+	const char *name = NULL;
+
+	fdt = get_embedded_dt();
+	if (!fdt)
+		panic();
+
+	node = fdt_node_offset_by_compatible(fdt, -1, "st,stm32mp1-usbphyc");
+	if (node < 0)
+		return -FDT_ERR_NOTFOUND;
+
+	fdt_for_each_subnode(subnode, fdt, node) {
+		cuint = fdt_getprop(fdt, subnode, "phy-supply", NULL);
+		if (cuint)
+			break;
+	}
+	if (!cuint)
+		return -FDT_ERR_NOTFOUND;
+
+	node = fdt_node_offset_by_phandle(fdt, fdt32_to_cpu(*cuint));
+	if (node < 0)
+		return -FDT_ERR_NOTFOUND;
+
+	name = fdt_get_name(fdt, node, NULL);
+	assert(name);
+	usb_supply_name = strdup(name);
+	if (!usb_supply_name)
+		panic();
+
+	return 0;
+}
+
+const char *stm32mp_pmic_get_usb_supply_name(void)
+{
+	return usb_supply_name;
+}
+
 /* Preallocate not that much regu references */
 static char *nsec_access_regu_name[PMIC_REGU_COUNT];
 
@@ -452,6 +497,9 @@ static void parse_regulator_fdt_nodes(void)
 
 	if (save_cpu_supply_name())
 		DMSG("No CPU supply provided");
+
+	if (save_usb_supply_name())
+		DMSG("No USB supply provided");
 }
 
 /*

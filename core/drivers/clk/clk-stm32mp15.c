@@ -1,24 +1,46 @@
 // SPDX-License-Identifier: (BSD-3-Clause OR GPL-2.0+)
 /*
- * Copyright (C) 2018-2019, STMicroelectronics
+ * Copyright (C) 2018-2020, STMicroelectronics
  */
 
 #include <assert.h>
+#include <drivers/clk.h>
 #include <drivers/stm32mp1_rcc.h>
 #include <dt-bindings/clock/stm32mp1-clks.h>
+#include <dt-bindings/clock/stm32mp1-clksrc.h>
 #include <initcall.h>
 #include <io.h>
 #include <keep.h>
+#include <kernel/delay.h>
 #include <kernel/dt.h>
 #include <kernel/boot.h>
 #include <kernel/panic.h>
+#include <kernel/pm.h>
 #include <kernel/spinlock.h>
 #include <libfdt.h>
 #include <platform_config.h>
 #include <stdio.h>
 #include <stm32_util.h>
+#include <tee_api_types.h>
 #include <trace.h>
 #include <util.h>
+
+#define DT_OPP_COMPAT		"operating-points-v2"
+
+/* PLL settings computation related definitions */
+#define POST_DIVM_MIN	8000000
+#define POST_DIVM_MAX	16000000
+#define DIVM_MIN	0
+#define DIVM_MAX	63
+#define DIVN_MIN	24
+#define DIVN_MAX	99
+#define DIVP_MIN	0
+#define DIVP_MAX	127
+#define FRAC_MAX	8192
+#define VCO_MIN		800000000
+#define VCO_MAX		1600000000
+
+#define PLL1_SETTINGS_VALID_ID		0x504C4C31 /* "PLL1" */
 
 /* Identifiers for root oscillators */
 enum stm32mp_osc_id {
@@ -85,11 +107,14 @@ enum stm32mp1_parent_sel {
 	_UART24_SEL,
 	_UART35_SEL,
 	_UART78_SEL,
+	_SDMMC12_SEL,
+	_SDMMC3_SEL,
 	_AXISS_SEL,
 	_MCUSS_SEL,
 	_USBPHY_SEL,
 	_USBO_SEL,
 	_RTC_SEL,
+	_MPU_SEL,
 	_PARENT_SEL_NB,
 	_UNKNOWN_SEL = 0xff,
 };
@@ -160,6 +185,16 @@ enum stm32mp1_div_id {
 	_DIV_NB,
 };
 
+enum stm32mp1_pllcfg {
+	PLLCFG_M,
+	PLLCFG_N,
+	PLLCFG_P,
+	PLLCFG_Q,
+	PLLCFG_R,
+	PLLCFG_O,
+	PLLCFG_NB
+};
+
 enum stm32mp1_plltype {
 	PLL_800,
 	PLL_1600,
@@ -210,6 +245,21 @@ struct stm32mp1_clk_pll {
 	uint16_t pllxcr;
 	uint16_t pllxcsgr;
 	enum stm32mp_osc_id refclk[REFCLK_SIZE];
+};
+
+struct stm32mp1_pll {
+	uint8_t refclk_min;
+	uint8_t refclk_max;
+	uint8_t divn_max;
+};
+
+/* Compact structure of 32bit cells, copied raw when suspending */
+struct stm32mp1_pll_settings {
+	uint32_t valid_id;
+	uint32_t freq[PLAT_MAX_OPP_NB];
+	uint32_t volt[PLAT_MAX_OPP_NB];
+	uint32_t cfg[PLAT_MAX_OPP_NB][PLAT_MAX_PLLCFG_NB];
+	uint32_t frac[PLAT_MAX_OPP_NB];
 };
 
 #define N_S	0	/* Non-secure can access RCC interface */
@@ -380,6 +430,18 @@ static const struct stm32mp1_clk_gate stm32mp1_clk_gate[] = {
 	_CLK_SC_FIXED(N_S, RCC_MP_APB3ENSETR, 11, SYSCFG, _UNKNOWN_ID),
 	_CLK_SC_SELEC(N_S, RCC_MP_APB4ENSETR, 8, DDRPERFM, _UNKNOWN_SEL),
 	_CLK_SC_SELEC(N_S, RCC_MP_APB4ENSETR, 15, IWDG2, _UNKNOWN_SEL),
+#ifdef STM32MP1_USE_MPU0_RESET
+	_CLK_SC_SELEC(N_S, RCC_MP_APB4ENSETR, 0, LTDC_PX, _UNKNOWN_SEL),
+	_CLK_SC_SELEC(N_S, RCC_MP_AHB2ENSETR, 0, DMA1, _UNKNOWN_SEL),
+	_CLK_SC_SELEC(N_S, RCC_MP_AHB2ENSETR, 1, DMA2, _UNKNOWN_SEL),
+	_CLK_SC_SELEC(N_S, RCC_MP_AHB2ENSETR, 8, USBO_K, _USBO_SEL),
+	_CLK_SC_SELEC(N_S, RCC_MP_AHB2ENSETR, 16, SDMMC3_K, _SDMMC3_SEL),
+	_CLK_SC_SELEC(N_S, RCC_MP_AHB6ENSETR, 5, GPU, _UNKNOWN_SEL),
+	_CLK_SC_FIXED(N_S, RCC_MP_AHB6ENSETR, 10, ETHMAC, _ACLK),
+	_CLK_SC_SELEC(N_S, RCC_MP_AHB6ENSETR, 16, SDMMC1_K, _SDMMC12_SEL),
+	_CLK_SC_SELEC(N_S, RCC_MP_AHB6ENSETR, 17, SDMMC2_K, _SDMMC12_SEL),
+	_CLK_SC_SELEC(N_S, RCC_MP_AHB6ENSETR, 24, USBH, _UNKNOWN_SEL),
+#endif
 
 	_CLK_SELEC(N_S, RCC_DBGCFGR, 8, CK_DBG, _UNKNOWN_SEL),
 };
@@ -406,6 +468,10 @@ static const uint8_t rng1_parents[] = {
 	_CSI, _PLL4_R, _LSE, _LSI
 };
 
+static const uint8_t mpu_parents[] = {
+	_HSI, _HSE, _PLL1_P, _PLL1_P /* specific div */
+};
+
 /* Parents for (some) non-secure clocks */
 #ifdef CFG_WITH_NSEC_UARTS
 static const uint8_t uart6_parents[] = {
@@ -429,6 +495,24 @@ static const uint8_t rtc_parents[] = {
 	_UNKNOWN_ID, _LSE, _LSI, _HSE
 };
 
+#ifdef STM32MP1_USE_MPU0_RESET
+static const uint8_t usbphy_parents[] = {
+	_HSE_KER, _PLL4_R, _HSE_KER_DIV2
+};
+
+static const uint8_t usbo_parents[] = {
+	_PLL4_R, _USB_PHY_48
+};
+
+static const uint8_t sdmmc12_parents[] = {
+	_HCLK6, _PLL3_R, _PLL4_P, _HSI_KER
+};
+
+static const uint8_t sdmmc3_parents[] = {
+	_HCLK2, _PLL3_R, _PLL4_P, _HSI_KER
+};
+#endif
+
 static const struct stm32mp1_clk_sel stm32mp1_clk_sel[_PARENT_SEL_NB] = {
 	/* Secure aware clocks */
 	_CLK_PARENT(_STGEN_SEL, RCC_STGENCKSELR, 0, 0x3, stgen_parents),
@@ -437,6 +521,9 @@ static const struct stm32mp1_clk_sel stm32mp1_clk_sel[_PARENT_SEL_NB] = {
 	_CLK_PARENT(_USART1_SEL, RCC_UART1CKSELR, 0, 0x7, usart1_parents),
 	_CLK_PARENT(_RNG1_SEL, RCC_RNG1CKSELR, 0, 0x3, rng1_parents),
 	_CLK_PARENT(_RTC_SEL, RCC_BDCR, 0, 0x3, rtc_parents),
+	_CLK_PARENT(_MPU_SEL, RCC_MPCKSELR, 0, 0x3, mpu_parents),
+	_CLK_PARENT(_AXISS_SEL, RCC_ASSCKSELR, 0, 0x3, axiss_parents),
+	_CLK_PARENT(_MCUSS_SEL, RCC_MSSCKSELR, 0, 0x3, mcuss_parents),
 	/* Always non-secure clocks (maybe used in some way in secure world) */
 #ifdef CFG_WITH_NSEC_UARTS
 	_CLK_PARENT(_UART6_SEL, RCC_UART6CKSELR, 0, 0x7, uart6_parents),
@@ -444,8 +531,26 @@ static const struct stm32mp1_clk_sel stm32mp1_clk_sel[_PARENT_SEL_NB] = {
 	_CLK_PARENT(_UART35_SEL, RCC_UART35CKSELR, 0, 0x7, uart234578_parents),
 	_CLK_PARENT(_UART78_SEL, RCC_UART78CKSELR, 0, 0x7, uart234578_parents),
 #endif
-	_CLK_PARENT(_AXISS_SEL, RCC_ASSCKSELR, 0, 0x3, axiss_parents),
-	_CLK_PARENT(_MCUSS_SEL, RCC_MSSCKSELR, 0, 0x3, mcuss_parents),
+#ifdef STM32MP1_USE_MPU0_RESET
+	_CLK_PARENT(_SDMMC12_SEL, RCC_SDMMC12CKSELR, 0, 0x7, sdmmc12_parents),
+	_CLK_PARENT(_SDMMC3_SEL, RCC_SDMMC3CKSELR, 0, 0x7, sdmmc3_parents),
+	_CLK_PARENT(_USBPHY_SEL, RCC_USBCKSELR, 0, 0x3, usbphy_parents),
+	_CLK_PARENT(_USBO_SEL, RCC_USBCKSELR, 4, 0x1, usbo_parents),
+#endif
+};
+
+/* Define characteristics of PLL according type */
+static const struct stm32mp1_pll stm32mp1_pll[PLL_TYPE_NB] = {
+	[PLL_800] = {
+		.refclk_min = 4,
+		.refclk_max = 16,
+		.divn_max = 99,
+	},
+	[PLL_1600] = {
+		.refclk_min = 8,
+		.refclk_max = 16,
+		.divn_max = 199,
+	},
 };
 
 /* PLLNCFGR2 register divider by output */
@@ -549,6 +654,10 @@ static unsigned long osc_frequency(enum stm32mp_osc_id idx)
 static unsigned int gate_refcounts[NB_GATES];
 static unsigned int refcount_lock;
 
+/* Storage of the precomputed SoC settings for PLL1 various OPPs */
+static struct stm32mp1_pll_settings pll1_settings;
+static uint32_t current_opp_khz;
+
 static const struct stm32mp1_clk_gate *gate_ref(unsigned int idx)
 {
 	return &stm32mp1_clk_gate[idx];
@@ -591,7 +700,7 @@ static enum stm32mp1_parent_id stm32mp1_clk_get_fixed_parent(int i)
 	return (enum stm32mp1_parent_id)gate_ref(i)->fixed;
 }
 
-static int stm32mp1_clk_get_parent(unsigned long id)
+static int __clk_get_parent(unsigned long id)
 {
 	const struct stm32mp1_clk_sel *sel = NULL;
 	enum stm32mp1_parent_id parent_id = 0;
@@ -701,7 +810,153 @@ static unsigned long stm32mp1_read_pll_freq(enum stm32mp1_pll_id pll_id,
 	return dfout;
 }
 
-static unsigned long get_clock_rate(int p)
+static void pll_start(enum stm32mp1_pll_id pll_id)
+{
+	const struct stm32mp1_clk_pll *pll = pll_ref(pll_id);
+	uint32_t pllxcr = stm32_rcc_base() + pll->pllxcr;
+
+	if (io_read32(pllxcr) & RCC_PLLNCR_PLLON)
+		return;
+
+	io_clrsetbits32(pllxcr,	RCC_PLLNCR_DIVPEN | RCC_PLLNCR_DIVQEN |
+			RCC_PLLNCR_DIVREN, RCC_PLLNCR_PLLON);
+}
+
+#define PLLRDY_TIMEOUT_US	(200 * 1000)
+
+static int pll_output(enum stm32mp1_pll_id pll_id, uint32_t output)
+{
+	const struct stm32mp1_clk_pll *pll = pll_ref(pll_id);
+	uint32_t pllxcr = stm32_rcc_base() + pll->pllxcr;
+	uint64_t start = 0;
+
+	start = timeout_init_us(PLLRDY_TIMEOUT_US);
+	/* Wait PLL lock */
+	while (!(io_read32(pllxcr) & RCC_PLLNCR_PLLRDY))
+		if (timeout_elapsed(start)) {
+			EMSG("PLL%d start failed @ 0x%"PRIx32": 0x%"PRIx32,
+			     pll_id, pllxcr, io_read32(pllxcr));
+			return -1;
+		}
+
+	/* Start the requested output */
+	io_setbits32(pllxcr, output << RCC_PLLNCR_DIVEN_SHIFT);
+
+	return 0;
+}
+
+static int pll_stop(enum stm32mp1_pll_id pll_id)
+{
+	const struct stm32mp1_clk_pll *pll = pll_ref(pll_id);
+	uint32_t pllxcr = stm32_rcc_base() + pll->pllxcr;
+	uint64_t start = 0;
+
+	/* Stop all output */
+	io_clrbits32(pllxcr, RCC_PLLNCR_DIVPEN | RCC_PLLNCR_DIVQEN |
+		     RCC_PLLNCR_DIVREN);
+
+	/* Stop PLL */
+	io_clrbits32(pllxcr, RCC_PLLNCR_PLLON);
+
+	start = timeout_init_us(PLLRDY_TIMEOUT_US);
+	/* Wait PLL stopped */
+	while (!(io_read32(pllxcr) & RCC_PLLNCR_PLLRDY))
+		if (timeout_elapsed(start)) {
+			EMSG("PLL%d stop failed @ 0x%"PRIx32": 0x%"PRIx32,
+			     pll_id, pllxcr, io_read32(pllxcr));
+
+			return -1;
+		}
+
+	return 0;
+}
+
+static uint32_t pll_compute_pllxcfgr2(uint32_t *pllcfg)
+{
+	uint32_t value = 0;
+
+	value = (pllcfg[PLLCFG_P] << RCC_PLLNCFGR2_DIVP_SHIFT) &
+		RCC_PLLNCFGR2_DIVP_MASK;
+	value |= (pllcfg[PLLCFG_Q] << RCC_PLLNCFGR2_DIVQ_SHIFT) &
+		 RCC_PLLNCFGR2_DIVQ_MASK;
+	value |= (pllcfg[PLLCFG_R] << RCC_PLLNCFGR2_DIVR_SHIFT) &
+		 RCC_PLLNCFGR2_DIVR_MASK;
+
+	return value;
+}
+
+static void pll_config_output(enum stm32mp1_pll_id pll_id, uint32_t *pllcfg)
+{
+	const struct stm32mp1_clk_pll *pll = pll_ref(pll_id);
+	uintptr_t rcc_base = stm32_rcc_base();
+	uint32_t value = 0;
+
+	value = pll_compute_pllxcfgr2(pllcfg);
+
+	io_write32(rcc_base + pll->pllxcfgr2, value);
+}
+
+static int pll_compute_pllxcfgr1(const struct stm32mp1_clk_pll *pll,
+				 uint32_t *pllcfg, uint32_t *cfgr1)
+{
+	uint32_t rcc_base = stm32_rcc_base();
+	enum stm32mp1_plltype type = pll->plltype;
+	unsigned long refclk = 0;
+	uint32_t ifrge = 0;
+	uint32_t src = 0;
+
+	src = io_read32(rcc_base + pll->rckxselr) &
+	      RCC_SELR_REFCLK_SRC_MASK;
+
+	refclk = osc_frequency(pll->refclk[src]) /
+		 (pllcfg[PLLCFG_M] + 1U);
+
+	if ((refclk < (stm32mp1_pll[type].refclk_min * 1000000U)) ||
+	    (refclk > (stm32mp1_pll[type].refclk_max * 1000000U)))
+		return -1;
+
+	if ((type == PLL_800) && (refclk >= 8000000U))
+		ifrge = 1U;
+
+	*cfgr1 = (pllcfg[PLLCFG_N] << RCC_PLLNCFGR1_DIVN_SHIFT) &
+		 RCC_PLLNCFGR1_DIVN_MASK;
+	*cfgr1 |= (pllcfg[PLLCFG_M] << RCC_PLLNCFGR1_DIVM_SHIFT) &
+		  RCC_PLLNCFGR1_DIVM_MASK;
+	*cfgr1 |= (ifrge << RCC_PLLNCFGR1_IFRGE_SHIFT) &
+		  RCC_PLLNCFGR1_IFRGE_MASK;
+
+	return 0;
+}
+
+static int pll_config(enum stm32mp1_pll_id pll_id, uint32_t *pllcfg,
+		      uint32_t fracv)
+{
+	const struct stm32mp1_clk_pll *pll = pll_ref(pll_id);
+	uint32_t rcc_base = stm32_rcc_base();
+	uint32_t value = 0;
+	int ret = 0;
+
+	ret = pll_compute_pllxcfgr1(pll, pllcfg, &value);
+	if (ret)
+		return ret;
+
+	io_write32(rcc_base + pll->pllxcfgr1, value);
+
+	/* Fractional configuration */
+	io_write32(rcc_base + pll->pllxfracr, value);
+
+	/* Frac must be enabled only once its configuration is loaded */
+	value = fracv << RCC_PLLNFRACR_FRACV_SHIFT;
+	io_write32(rcc_base + pll->pllxfracr, value);
+	value = io_read32(rcc_base + pll->pllxfracr);
+	io_write32(rcc_base + pll->pllxfracr, value | RCC_PLLNFRACR_FRACLE);
+
+	pll_config_output(pll_id, pllcfg);
+
+	return 0;
+}
+
+static unsigned long __clk_get_parent_rate(enum stm32mp1_parent_id p)
 {
 	uint32_t reg = 0;
 	unsigned long clock = 0;
@@ -964,7 +1219,7 @@ static bool clock_is_always_on(unsigned long id)
 	}
 }
 
-bool stm32_clock_is_enabled(unsigned long id)
+static bool clk_stm32_is_enabled(unsigned long id)
 {
 	int i = 0;
 
@@ -978,13 +1233,13 @@ bool stm32_clock_is_enabled(unsigned long id)
 	return __clk_is_enabled(gate_ref(i));
 }
 
-void stm32_clock_enable(unsigned long id)
+static TEE_Result clk_stm32_enable(unsigned long id)
 {
 	int i = 0;
 	uint32_t exceptions = 0;
 
 	if (clock_is_always_on(id))
-		return;
+		return TEE_SUCCESS;
 
 	i = stm32mp1_clk_get_gated_id(id);
 	if (i < 0) {
@@ -995,7 +1250,7 @@ void stm32_clock_enable(unsigned long id)
 	if (gate_is_non_secure(gate_ref(i))) {
 		/* Enable non-secure clock w/o any refcounting */
 		__clk_enable(gate_ref(i));
-		return;
+		return TEE_SUCCESS;
 	}
 
 	exceptions = may_spin_lock(&refcount_lock);
@@ -1006,9 +1261,11 @@ void stm32_clock_enable(unsigned long id)
 	gate_refcounts[i]++;
 
 	may_spin_unlock(&refcount_lock, exceptions);
+
+	return TEE_SUCCESS;
 }
 
-void stm32_clock_disable(unsigned long id)
+static void clk_stm32_disable(unsigned long id)
 {
 	int i = 0;
 	uint32_t exceptions = 0;
@@ -1067,16 +1324,16 @@ static long get_timer_rate(long parent_rate, unsigned int apb_bus)
 	return parent_rate * (timgxpre + 1) * 2;
 }
 
-unsigned long stm32_clock_get_rate(unsigned long id)
+static unsigned long clk_stm32_get_rate(unsigned long id)
 {
-	int p = 0;
+	enum stm32mp1_parent_id p = _UNKNOWN_ID;
 	unsigned long rate = 0;
 
-	p = stm32mp1_clk_get_parent(id);
+	p = __clk_get_parent(id);
 	if (p < 0)
 		return 0;
 
-	rate = get_clock_rate(p);
+	rate = __clk_get_parent_rate(p);
 
 	if ((id >= TIM2_K) && (id <= TIM14_K))
 		rate = get_timer_rate(rate, 1);
@@ -1210,7 +1467,7 @@ static void secure_parent_clocks(unsigned long parent_id)
 
 void stm32mp_register_clock_parents_secure(unsigned long clock_id)
 {
-	int parent_id = stm32mp1_clk_get_parent(clock_id);
+	enum stm32mp1_parent_id parent_id = __clk_get_parent(clock_id);
 
 	if (parent_id < 0) {
 		DMSG("No parent for clock %lu", clock_id);
@@ -1219,6 +1476,14 @@ void stm32mp_register_clock_parents_secure(unsigned long clock_id)
 
 	secure_parent_clocks(parent_id);
 }
+
+static const struct clk_ops stm32mp_clk_ops = {
+	.enable		= clk_stm32_enable,
+	.disable	= clk_stm32_disable,
+	.is_enabled	= clk_stm32_is_enabled,
+	.get_rate	= clk_stm32_get_rate,
+};
+DECLARE_KEEP_PAGER(stm32mp_clk_ops);
 
 #ifdef CFG_EMBED_DTB
 static const char *stm32mp_osc_node_label[NB_OSC] = {
@@ -1291,15 +1556,15 @@ static void enable_static_secure_clocks(void)
 	};
 
 	for (idx = 0; idx < ARRAY_SIZE(secure_enable); idx++) {
-		stm32_clock_enable(secure_enable[idx]);
+		clk_stm32_enable(secure_enable[idx]);
 		stm32mp_register_clock_parents_secure(secure_enable[idx]);
 	}
 
 	if (CFG_TEE_CORE_NB_CORE > 1)
-		stm32_clock_enable(RTCAPB);
+		clk_stm32_enable(RTCAPB);
 }
 
-static TEE_Result stm32mp1_clk_early_init(void)
+static void stm32mp1_clk_early_init(void)
 {
 	void *fdt = NULL;
 	int node = 0;
@@ -1308,18 +1573,21 @@ static TEE_Result stm32mp1_clk_early_init(void)
 	int ignored = 0;
 
 	fdt = get_embedded_dt();
-	node = fdt_node_offset_by_compatible(fdt, -1, DT_RCC_CLK_COMPAT);
+	node = fdt_node_offset_by_compatible(fdt, -1, DT_RCC_SEC_CLK_COMPAT);
 
-	if (node < 0 || _fdt_reg_base_address(fdt, node) != RCC_BASE)
-		panic();
-
-	if (_fdt_get_status(fdt, node) & DT_STATUS_OK_SEC) {
-		io_setbits32(stm32_rcc_base() + RCC_TZCR, RCC_TZCR_TZEN);
+	if (node < 0 || _fdt_reg_base_address(fdt, node) != RCC_BASE) {
+		/* Check non secure compatible */
+		node = fdt_node_offset_by_compatible(fdt, -1,
+						     DT_RCC_CLK_COMPAT);
+		if (node < 0 || _fdt_reg_base_address(fdt, node) != RCC_BASE) {
+			panic();
+		} else {
+			io_clrbits32(stm32_rcc_base() + RCC_TZCR,
+				     RCC_TZCR_TZEN);
+			IMSG("RCC is non secure");
+		}
 	} else {
-		if (io_read32(stm32_rcc_base() + RCC_TZCR) & RCC_TZCR_TZEN)
-			panic("Refuse to release RCC[TZEN]");
-
-		IMSG("RCC is non-secure");
+		io_setbits32(stm32_rcc_base() + RCC_TZCR, RCC_TZCR_TZEN);
 	}
 
 	get_osc_freq_from_dt(fdt);
@@ -1360,11 +1628,1024 @@ static TEE_Result stm32mp1_clk_early_init(void)
 
 	if (ignored != 0)
 		IMSG("DT clock tree configurations were ignored");
+}
 
-	enable_static_secure_clocks();
+/*
+ * Gets OPP parameters (frequency in KHz and voltage in mV) from an OPP table
+ * subnode. Platform HW support capabilities are also checked.
+ */
+static int get_opp_freqvolt_from_dt_subnode(void *fdt, int subnode,
+					    uint32_t *freq_khz,
+					    uint32_t *voltage_mv)
+{
+	const fdt64_t *cuint64 = NULL;
+	const fdt32_t *cuint32 = NULL;
+	uint64_t read_freq_64 = 0;
+	uint32_t read_voltage_32 = 0;
+
+	assert(freq_khz);
+	assert(voltage_mv);
+
+	cuint32 = fdt_getprop(fdt, subnode, "opp-supported-hw", NULL);
+	if (cuint32)
+		if (!stm32mp_supports_cpu_opp(fdt32_to_cpu(*cuint32))) {
+			DMSG("Invalid opp-supported-hw 0x%"PRIx32,
+			     fdt32_to_cpu(*cuint32));
+			return -FDT_ERR_BADVALUE;
+		}
+
+	cuint64 = fdt_getprop(fdt, subnode, "opp-hz", NULL);
+	if (!cuint64) {
+		DMSG("Missing opp-hz");
+		return -FDT_ERR_NOTFOUND;
+	}
+
+	/* Frequency value expressed in KHz must fit on 32 bits */
+	read_freq_64 = fdt64_to_cpu(*cuint64) / 1000ULL;
+	if (read_freq_64 > (uint64_t)UINT32_MAX) {
+		DMSG("Invalid opp-hz %"PRIu64, read_freq_64);
+		return -FDT_ERR_BADVALUE;
+	}
+
+	cuint32 = fdt_getprop(fdt, subnode, "opp-microvolt", NULL);
+	if (!cuint32) {
+		DMSG("Missing opp-microvolt");
+		return -FDT_ERR_NOTFOUND;
+	}
+
+	/* Millivolt value must fit on 16 bits */
+	read_voltage_32 = fdt32_to_cpu(*cuint32) / 1000U;
+	if (read_voltage_32 > UINT16_MAX) {
+		DMSG("Invalid opp-microvolt %"PRIu32, read_voltage_32);
+		return -FDT_ERR_BADVALUE;
+	}
+
+	*freq_khz = (uint32_t)read_freq_64;
+
+	*voltage_mv = read_voltage_32;
+
+	return 0;
+}
+
+/*
+ * Parses OPP table in DT and finds all parameters supported by the HW
+ * platform. If found, the corresponding frequency and voltage values are
+ * respectively stored in @pll1_settings structure.
+ * Note that @*count has to be set by caller to the effective size allocated
+ * for both tables. Its value is then replaced by the number of filled elements.
+ */
+static int get_all_opp_freqvolt_from_dt(uint32_t *count)
+{
+	void *fdt = NULL;
+	int node = 0;
+	int subnode = 0;
+	uint32_t idx = 0;
+
+	assert(count);
+
+	fdt = get_embedded_dt();
+	node = fdt_node_offset_by_compatible(fdt, -1, DT_OPP_COMPAT);
+	if (node < 0)
+		return node;
+
+	fdt_for_each_subnode(subnode, fdt, node) {
+		uint32_t read_freq = 0;
+		uint32_t read_voltage = 0;
+
+		if (get_opp_freqvolt_from_dt_subnode(fdt, subnode, &read_freq,
+						     &read_voltage))
+			continue;
+
+		if (idx >= *count)
+			return -FDT_ERR_NOSPACE;
+
+		pll1_settings.freq[idx] = read_freq;
+		pll1_settings.volt[idx] = read_voltage;
+		idx++;
+	}
+
+	if (!idx)
+		return -FDT_ERR_NOTFOUND;
+
+	*count = idx;
+
+	return 0;
+}
+
+static int clk_compute_pll1_settings(unsigned long input_freq, int idx)
+{
+	unsigned long post_divm = 0;
+	unsigned long long output_freq = pll1_settings.freq[idx] * 1000U;
+	unsigned long long freq = 0;
+	unsigned long long vco = 0;
+	int divm = 0;
+	int divn = 0;
+	int divp = 0;
+	int frac = 0;
+	int i = 0;
+	unsigned int diff = 0;
+	unsigned int best_diff = UINT_MAX;
+
+	/* Following parameters have always the same value */
+	pll1_settings.cfg[idx][PLLCFG_Q] = 0;
+	pll1_settings.cfg[idx][PLLCFG_R] = 0;
+	pll1_settings.cfg[idx][PLLCFG_O] = PQR(1, 0, 0);
+
+	for (divm = DIVM_MAX; divm >= DIVM_MIN; divm--)	{
+		post_divm = input_freq / (unsigned long)(divm + 1);
+
+		if ((post_divm < POST_DIVM_MIN) ||
+		    (post_divm > POST_DIVM_MAX))
+			continue;
+
+		for (divp = DIVP_MIN; divp <= DIVP_MAX; divp++) {
+
+			freq = output_freq * (divm + 1) * (divp + 1);
+
+			divn = (int)((freq / input_freq) - 1);
+			if ((divn < DIVN_MIN) || (divn > DIVN_MAX))
+				continue;
+
+			frac = (int)(((freq * FRAC_MAX) / input_freq) -
+				     ((divn + 1) * FRAC_MAX));
+
+			/* 2 loops to refine the fractional part */
+			for (i = 2; i != 0; i--) {
+				if (frac > FRAC_MAX)
+					break;
+
+				vco = (post_divm * (divn + 1)) +
+				      ((post_divm * (unsigned long long)frac) /
+				       FRAC_MAX);
+
+				if ((vco < (VCO_MIN / 2)) ||
+				    (vco > (VCO_MAX / 2))) {
+					frac++;
+					continue;
+				}
+
+				freq = vco / (divp + 1);
+				if (output_freq < freq)
+					diff = (unsigned int)(freq -
+							      output_freq);
+				else
+					diff = (unsigned int)(output_freq -
+							      freq);
+
+				if (diff < best_diff)  {
+					pll1_settings.cfg[idx][PLLCFG_M] = divm;
+					pll1_settings.cfg[idx][PLLCFG_N] = divn;
+					pll1_settings.cfg[idx][PLLCFG_P] = divp;
+					pll1_settings.frac[idx] = frac;
+
+					if (!diff)
+						return 0;
+
+					best_diff = diff;
+				}
+
+				frac++;
+			}
+		}
+	}
+
+	if (best_diff == UINT_MAX) {
+		pll1_settings.cfg[idx][PLLCFG_O] = 0;
+		return -1;
+	}
+
+	return 0;
+}
+
+static int clk_get_pll1_settings(uint32_t clksrc, int index)
+{
+	unsigned long input_freq = 0;
+	unsigned int i = 0;
+
+	for (i = 0; i < PLAT_MAX_OPP_NB; i++)
+		if (pll1_settings.freq[i] == pll1_settings.freq[index])
+			break;
+
+	if (((i == PLAT_MAX_OPP_NB) &&
+	     !stm32mp1_clk_pll1_settings_are_valid()) ||
+	    ((i < PLAT_MAX_OPP_NB) && !pll1_settings.cfg[i][PLLCFG_O])) {
+		/*
+		 * Either PLL1 settings structure is completely empty,
+		 * or these settings are not yet computed: do it.
+		 */
+		switch (clksrc) {
+		case CLK_PLL12_HSI:
+			input_freq = clk_stm32_get_rate(CK_HSI);
+			break;
+		case CLK_PLL12_HSE:
+			input_freq = clk_stm32_get_rate(CK_HSE);
+			break;
+		default:
+			panic();
+		}
+
+		return clk_compute_pll1_settings(input_freq, index);
+	}
+
+	if (i < PLAT_MAX_OPP_NB) {
+		if (pll1_settings.cfg[i][PLLCFG_O])
+			return 0;
+
+		/*
+		 * Index is in range and PLL1 settings are computed:
+		 * use content to answer to the request.
+		 */
+		memcpy(&pll1_settings.cfg[index][0], &pll1_settings.cfg[i][0],
+		       sizeof(uint32_t) * PLAT_MAX_PLLCFG_NB);
+		pll1_settings.frac[index] = pll1_settings.frac[i];
+
+		return 0;
+	}
+
+	return -1;
+}
+
+static int clk_save_current_pll1_settings(uint32_t buck1_voltage)
+{
+	const struct stm32mp1_clk_pll *pll = pll_ref(_PLL1);
+	uint32_t rcc_base = stm32_rcc_base();
+	uint32_t freq = 0;
+	unsigned int i = 0;
+
+	freq = UDIV_ROUND_NEAREST(clk_stm32_get_rate(CK_MPU), 1000L);
+
+	for (i = 0; i < PLAT_MAX_OPP_NB; i++)
+		if (pll1_settings.freq[i] == freq)
+			break;
+
+	if ((i == PLAT_MAX_OPP_NB) ||
+	    ((pll1_settings.volt[i] != buck1_voltage) && buck1_voltage))
+		return -1;
+
+	pll1_settings.cfg[i][PLLCFG_M] = (io_read32(rcc_base + pll->pllxcfgr1) &
+					  RCC_PLLNCFGR1_DIVM_MASK) >>
+					 RCC_PLLNCFGR1_DIVM_SHIFT;
+
+	pll1_settings.cfg[i][PLLCFG_N] = (io_read32(rcc_base + pll->pllxcfgr1) &
+					  RCC_PLLNCFGR1_DIVN_MASK) >>
+					 RCC_PLLNCFGR1_DIVN_SHIFT;
+
+	pll1_settings.cfg[i][PLLCFG_P] = (io_read32(rcc_base + pll->pllxcfgr2) &
+					  RCC_PLLNCFGR2_DIVP_MASK) >>
+					 RCC_PLLNCFGR2_DIVP_SHIFT;
+
+	pll1_settings.cfg[i][PLLCFG_Q] = (io_read32(rcc_base + pll->pllxcfgr2) &
+					  RCC_PLLNCFGR2_DIVQ_MASK) >>
+					 RCC_PLLNCFGR2_DIVQ_SHIFT;
+
+	pll1_settings.cfg[i][PLLCFG_R] = (io_read32(rcc_base + pll->pllxcfgr2) &
+					  RCC_PLLNCFGR2_DIVR_MASK) >>
+					 RCC_PLLNCFGR2_DIVR_SHIFT;
+
+	pll1_settings.cfg[i][PLLCFG_O] = io_read32(rcc_base + pll->pllxcr) >>
+					 RCC_PLLNCR_DIVEN_SHIFT;
+
+	pll1_settings.frac[i] = (io_read32(rcc_base + pll->pllxfracr) &
+				 RCC_PLLNFRACR_FRACV_MASK) >>
+				RCC_PLLNFRACR_FRACV_SHIFT;
+
+	return i;
+}
+
+static uint32_t stm32mp1_clk_get_pll1_current_clksrc(void)
+{
+	uint32_t value = 0;
+	const struct stm32mp1_clk_pll *pll = pll_ref(_PLL1);
+	uint32_t rcc_base = stm32_rcc_base();
+
+	value = io_read32(rcc_base + pll->rckxselr);
+
+	switch (value & RCC_SELR_REFCLK_SRC_MASK) {
+	case 0:
+		return CLK_PLL12_HSI;
+	case 1:
+		return CLK_PLL12_HSE;
+	default:
+		panic();
+	}
+}
+
+int stm32mp1_clk_compute_all_pll1_settings(uint32_t buck1_voltage)
+{
+	unsigned int i = 0;
+	int ret = 0;
+	int index = 0;
+	uint32_t count = PLAT_MAX_OPP_NB;
+	uint32_t clksrc = 0;
+
+	ret = get_all_opp_freqvolt_from_dt(&count);
+	switch (ret) {
+	case 0:
+		break;
+	case -FDT_ERR_NOTFOUND:
+		DMSG("Cannot find all OPP info in DT: use default settings.");
+		return 0;
+	default:
+		EMSG("Inconsistent OPP settings found in DT, ignored.");
+		return 0;
+	}
+
+	index = clk_save_current_pll1_settings(buck1_voltage);
+
+	clksrc = stm32mp1_clk_get_pll1_current_clksrc();
+
+	for (i = 0; i < count; i++) {
+		if (index >= 0 && i == (unsigned int)index)
+			continue;
+
+		ret = clk_get_pll1_settings(clksrc, i);
+		if (ret != 0)
+			return ret;
+	}
+
+	pll1_settings.valid_id = PLL1_SETTINGS_VALID_ID;
+
+	return 0;
+}
+
+void stm32mp1_clk_lp_save_opp_pll1_settings(uint8_t *data, size_t size)
+{
+	if ((size != sizeof(pll1_settings)) ||
+	    !stm32mp1_clk_pll1_settings_are_valid())
+		panic();
+
+	memcpy(data, &pll1_settings, size);
+}
+
+bool stm32mp1_clk_pll1_settings_are_valid(void)
+{
+	return pll1_settings.valid_id == PLL1_SETTINGS_VALID_ID;
+}
+#else
+static void stm32mp1_clk_early_init(void)
+{
+	vaddr_t rcc_base = stm32_rcc_base();
+
+	/* Expect booting from a secure setup */
+	if ((io_read32(rcc_base + RCC_TZCR) & RCC_TZCR_TZEN) == 0)
+		panic("RCC TZC[TZEN]");
+}
+
+int stm32mp1_clk_compute_all_pll1_settings(uint32_t buck1_voltage __unused)
+{
+	return 0;
+}
+
+void stm32mp1_clk_lp_save_opp_pll1_settings(uint8_t *data __unused,
+					    size_t size __unused)
+{
+}
+
+bool stm32mp1_clk_pll1_settings_are_valid(void)
+{
+	return false;
+}
+
+static void enable_static_secure_clocks(void)
+{
+}
+#endif /*CFG_EMBED_DTB*/
+
+/* Start MPU OPP */
+#define CLKSRC_TIMEOUT_US	(200 * 1000)
+#define CLKDIV_TIMEOUT_US	(200 * 1000)
+#define CLK_MPU_PLL1P		0x00000202
+#define CLK_MPU_PLL1P_DIV	0x00000203
+
+static int stm32mp1_set_clksrc(unsigned int clksrc)
+{
+	uintptr_t address = stm32_rcc_base() + (clksrc >> 4);
+	uint64_t timeout_ref = 0;
+
+	io_clrsetbits32(address, RCC_SELR_SRC_MASK, clksrc & RCC_SELR_SRC_MASK);
+
+	timeout_ref = timeout_init_us(CLKSRC_TIMEOUT_US);
+	while ((io_read32(address) & RCC_SELR_SRCRDY) == 0U) {
+		if (timeout_elapsed(timeout_ref)) {
+			EMSG("CLKSRC %u start failed @ 0x%"PRIxPTR": 0x%"PRIx32,
+			      clksrc, address, io_read32(address));
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+static int stm32mp1_set_clkdiv(unsigned int clkdiv, uintptr_t address)
+{
+	uint64_t timeout_ref = 0;
+
+	io_clrsetbits32(address, RCC_DIVR_DIV_MASK, clkdiv & RCC_DIVR_DIV_MASK);
+
+	timeout_ref = timeout_init_us(CLKDIV_TIMEOUT_US);
+	while ((io_read32(address) & RCC_DIVR_DIVRDY) == 0U) {
+		if (timeout_elapsed(timeout_ref)) {
+			EMSG("CLKDIV 0x%x start failed @ 0x%"PRIxPTR": 0x%"PRIx32,
+			     clkdiv, address, io_read32(address));
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * Check if PLL1 can be configured on the fly.
+ * @result  (-1) => config on the fly is not possible.
+ *          (0)  => config on the fly is possible.
+ *          (+1) => same parameters as those in place, no need to reconfig.
+ * Return value is 0 if no error.
+ */
+static int is_pll_config_on_the_fly(enum stm32mp1_pll_id pll_id,
+				    uint32_t *pllcfg, uint32_t fracv,
+				    int *result)
+{
+	const struct stm32mp1_clk_pll *pll = pll_ref(pll_id);
+	uintptr_t rcc_base = stm32_rcc_base();
+	uint32_t fracr = 0;
+	uint32_t value = 0;
+	int ret = 0;
+
+	ret = pll_compute_pllxcfgr1(pll, pllcfg, &value);
+	if (ret)
+		return ret;
+
+	if (io_read32(rcc_base + pll->pllxcfgr1) != value) {
+		/* Different DIVN/DIVM, can't config on the fly */
+		*result = -1;
+		return 0;
+	}
+
+	*result = true;
+
+	fracr = fracv << RCC_PLLNFRACR_FRACV_SHIFT;
+	fracr |= RCC_PLLNFRACR_FRACLE;
+	value = pll_compute_pllxcfgr2(pllcfg);
+
+	if ((io_read32(rcc_base + pll->pllxfracr) == fracr) &&
+	    (io_read32(rcc_base + pll->pllxcfgr2) == value))
+		/* Same parameters, no need to config */
+		*result = 1;
+	else
+		*result = 0;
+
+	return 0;
+}
+
+static int stm32mp1_get_mpu_div(uint32_t freq_khz)
+{
+	unsigned long freq_pll1_p;
+	unsigned long div;
+
+	freq_pll1_p = __clk_get_parent_rate(_PLL1_P) / 1000UL;
+	if ((freq_pll1_p % freq_khz) != 0U)
+		return -1;
+
+	div = freq_pll1_p / freq_khz;
+
+	switch (div) {
+	case 1UL:
+	case 2UL:
+	case 4UL:
+	case 8UL:
+	case 16UL:
+		return __builtin_ffs(div) - 1;
+	default:
+		return -1;
+	}
+}
+
+/* Configure PLL1 from input frequency OPP parameters */
+static int pll1_config_from_opp_khz(uint32_t freq_khz)
+{
+	unsigned int idx = 0;
+	int ret = 0;
+	int div = 0;
+	int config_on_the_fly = -1;
+
+	for (idx = 0; idx < PLAT_MAX_OPP_NB; idx++)
+		if (pll1_settings.freq[idx] == freq_khz)
+			break;
+
+	if (idx == PLAT_MAX_OPP_NB)
+		return -1;
+
+	div = stm32mp1_get_mpu_div(freq_khz);
+	switch (div) {
+	case -1:
+		break;
+	case 0:
+		return stm32mp1_set_clksrc(CLK_MPU_PLL1P);
+	default:
+		ret = stm32mp1_set_clkdiv(div, stm32_rcc_base() +
+					  RCC_MPCKDIVR);
+		if (ret == 0)
+			ret = stm32mp1_set_clksrc(CLK_MPU_PLL1P_DIV);
+
+		return ret;
+	}
+
+	ret = is_pll_config_on_the_fly(_PLL1, &pll1_settings.cfg[idx][0],
+				       pll1_settings.frac[idx],
+				       &config_on_the_fly);
+	if (ret)
+		return ret;
+
+	if (config_on_the_fly == 1)
+		return 0;
+
+	if (config_on_the_fly == -1) {
+		/* Switch to HSI and stop PLL1 before reconfiguration */
+		ret = stm32mp1_set_clksrc(CLK_MPU_HSI);
+		if (ret)
+			return ret;
+
+		ret = pll_stop(_PLL1);
+		if (ret)
+			return ret;
+	}
+
+	ret = pll_config(_PLL1, &pll1_settings.cfg[idx][0],
+			 pll1_settings.frac[idx]);
+	if (ret)
+		return ret;
+
+	if (config_on_the_fly == -1) {
+		/* Start PLL1 and switch back to after reconfiguration */
+		pll_start(_PLL1);
+
+		ret = pll_output(_PLL1, pll1_settings.cfg[idx][PLLCFG_O]);
+		if (ret)
+			return ret;
+
+		ret = stm32mp1_set_clksrc(CLK_MPU_PLL1P);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static void save_current_opp(void)
+{
+	unsigned long freq_khz = UDIV_ROUND_NEAREST(clk_stm32_get_rate(CK_MPU),
+						    1000UL);
+	if (freq_khz > (unsigned long)UINT32_MAX)
+		panic();
+
+	current_opp_khz = (uint32_t)freq_khz;
+}
+
+int stm32mp1_set_opp_khz(uint32_t freq_khz)
+{
+	uint32_t mpu_src = 0;
+
+	if (freq_khz == current_opp_khz)
+		return 0;
+
+	if (!stm32mp1_clk_pll1_settings_are_valid()) {
+		/*
+		 * No OPP table in DT or an error occurred during PLL1
+		 * settings computation, system can only work on current
+		 * operating point so return error.
+		 */
+		return -1;
+	}
+
+	/* Check that PLL1 is MPU clock source */
+	mpu_src = io_read32(stm32_rcc_base() + RCC_MPCKSELR) &
+		RCC_SELR_SRC_MASK;
+	if ((mpu_src != RCC_MPCKSELR_PLL) &&
+	    (mpu_src != RCC_MPCKSELR_PLL_MPUDIV))
+		return -1;
+
+	if (pll1_config_from_opp_khz(freq_khz)) {
+		/* Restore original value */
+		if (pll1_config_from_opp_khz(current_opp_khz)) {
+			EMSG("No CPU operating point can be set");
+			panic();
+		}
+
+		return -1;
+	}
+
+	current_opp_khz = freq_khz;
+
+	return 0;
+}
+
+int stm32mp1_round_opp_khz(uint32_t *freq_khz)
+{
+	unsigned int i = 0;
+	uint32_t round_opp = 0;
+
+	if (!stm32mp1_clk_pll1_settings_are_valid()) {
+		/*
+		 * No OPP table in DT, or an error occurred during PLL1
+		 * settings computation, system can only work on current
+		 * operating point, so return current CPU frequency.
+		 */
+		*freq_khz = current_opp_khz;
+
+		return 0;
+	}
+
+	for (i = 0; i < PLAT_MAX_OPP_NB; i++)
+		if ((pll1_settings.freq[i] <= *freq_khz) &&
+		    (pll1_settings.freq[i] > round_opp))
+			round_opp = pll1_settings.freq[i];
+
+	*freq_khz = round_opp;
+
+	return 0;
+}
+/* End PMU OPP */
+
+#ifdef CFG_PM
+struct soc_stop_context {
+	uint32_t pll3cr;
+	uint32_t pll4cr;
+	uint32_t mssckselr;
+	uint32_t mcudivr;
+};
+
+static struct soc_stop_context soc_stop_ctx;
+
+static void save_pll34_state(void)
+{
+	uintptr_t rcc_base = stm32_rcc_base();
+	struct soc_stop_context *ctx = &soc_stop_ctx;
+
+	ctx->pll3cr = io_read32(rcc_base + RCC_PLL3CR);
+	ctx->pll4cr = io_read32(rcc_base + RCC_PLL4CR);
+}
+
+static void save_mcu_subsys_clocks(void)
+{
+	uintptr_t rcc_base = stm32_rcc_base();
+	struct soc_stop_context *ctx = &soc_stop_ctx;
+
+	ctx->mssckselr = io_read32(rcc_base + RCC_MSSCKSELR);
+	ctx->mcudivr = io_read32(rcc_base + RCC_MCUDIVR) &
+		       RCC_MCUDIV_MASK;
+}
+
+static void restore_pll34_state(void)
+{
+	struct soc_stop_context *ctx = &soc_stop_ctx;
+
+	/* Let PLL4 start while we're starting and waiting for PLL3 */
+	if (ctx->pll4cr & RCC_PLLNCR_PLLON)
+		pll_start(_PLL4);
+
+	if (ctx->pll3cr & RCC_PLLNCR_PLLON) {
+		pll_start(_PLL3);
+		if (pll_output(_PLL3, ctx->pll3cr >> RCC_PLLNCR_DIVEN_SHIFT)) {
+			EMSG("Failed to restore PLL3");
+			panic();
+		}
+	}
+
+	if (ctx->pll4cr & RCC_PLLNCR_PLLON) {
+		if (pll_output(_PLL4, ctx->pll4cr >> RCC_PLLNCR_DIVEN_SHIFT)) {
+			EMSG("Failed to restore PLL4");
+			panic();
+		}
+	}
+}
+
+static void restore_mcu_subsys_clocks(void)
+{
+	uintptr_t rcc_base = stm32_rcc_base();
+	struct soc_stop_context *ctx = &soc_stop_ctx;
+
+	io_write32(rcc_base + RCC_MSSCKSELR, ctx->mssckselr);
+
+	if (stm32mp1_set_clkdiv(ctx->mcudivr, rcc_base + RCC_MCUDIVR)) {
+		EMSG("Failed to restore MCUDIVR");
+		panic();
+	}
+}
+
+/*
+ * Sequence to save/restore the non-secure configuration.
+ * Restoring clocks and muxes need IPs to run on kernel clock
+ * hence on configuration is restored at resume, kernel clock
+ * should be disable: this mandates secure access.
+ *
+ * backup_mux*_cfg for the clock muxes.
+ * backup_clock_sc_cfg for the set/clear clock gating registers
+ * backup_clock_cfg for the regular full write registers
+ */
+
+struct backup_mux_cfg {
+	uint16_t offset;
+	uint8_t value;
+	uint8_t bit_len;
+};
+
+#define MUXCFG(_offset, _bit_len) \
+	{ .offset = (_offset), .bit_len = (_bit_len) }
+
+struct backup_mux_cfg backup_mux0_cfg[] = {
+	MUXCFG(RCC_SDMMC12CKSELR, 3),
+	MUXCFG(RCC_SPI2S23CKSELR, 3),
+	MUXCFG(RCC_SPI45CKSELR, 3),
+	MUXCFG(RCC_I2C12CKSELR, 3),
+	MUXCFG(RCC_I2C35CKSELR, 3),
+	MUXCFG(RCC_LPTIM23CKSELR, 3),
+	MUXCFG(RCC_LPTIM45CKSELR, 3),
+	MUXCFG(RCC_UART24CKSELR, 3),
+	MUXCFG(RCC_UART35CKSELR, 3),
+	MUXCFG(RCC_UART78CKSELR, 3),
+	MUXCFG(RCC_SAI1CKSELR, 3),
+	MUXCFG(RCC_ETHCKSELR, 2),
+	MUXCFG(RCC_I2C46CKSELR, 3),
+	MUXCFG(RCC_RNG2CKSELR, 2),
+	MUXCFG(RCC_SDMMC3CKSELR, 3),
+	MUXCFG(RCC_FMCCKSELR, 2),
+	MUXCFG(RCC_QSPICKSELR, 2),
+	MUXCFG(RCC_USBCKSELR, 2),
+	MUXCFG(RCC_SPDIFCKSELR, 2),
+	MUXCFG(RCC_SPI2S1CKSELR, 3),
+	MUXCFG(RCC_CECCKSELR, 2),
+	MUXCFG(RCC_LPTIM1CKSELR, 3),
+	MUXCFG(RCC_UART6CKSELR, 3),
+	MUXCFG(RCC_FDCANCKSELR, 2),
+	MUXCFG(RCC_SAI2CKSELR, 3),
+	MUXCFG(RCC_SAI3CKSELR,  3),
+	MUXCFG(RCC_SAI4CKSELR, 3),
+	MUXCFG(RCC_ADCCKSELR, 2),
+	MUXCFG(RCC_DSICKSELR, 1),
+	MUXCFG(RCC_CPERCKSELR, 2),
+	MUXCFG(RCC_RNG1CKSELR, 2),
+	MUXCFG(RCC_STGENCKSELR, 2),
+	MUXCFG(RCC_UART1CKSELR, 3),
+	MUXCFG(RCC_SPI6CKSELR, 3),
+};
+
+struct backup_mux_cfg backup_mux4_cfg[] = {
+	MUXCFG(RCC_USBCKSELR, 1),
+};
+
+static void backup_mux_cfg(void)
+{
+	struct backup_mux_cfg *cfg = backup_mux0_cfg;
+	size_t count = ARRAY_SIZE(backup_mux0_cfg);
+	size_t i = 0;
+	uintptr_t base = stm32_rcc_base();
+
+	for (i = 0; i < count; i++)
+		cfg[i].value = io_read32(base + cfg[i].offset) &
+				GENMASK_32(cfg[i].bit_len - 1, 0);
+
+	cfg = backup_mux4_cfg;
+	count = ARRAY_SIZE(backup_mux4_cfg);
+
+	for (i = 0; i < count; i++)
+		cfg[i].value = io_read32(base + cfg[i].offset) &
+				GENMASK_32(4 + cfg[i].bit_len - 1, 4);
+}
+
+static void restore_mux_cfg(void)
+{
+	struct backup_mux_cfg *cfg = backup_mux0_cfg;
+	size_t count = ARRAY_SIZE(backup_mux0_cfg);
+	size_t i = 0;
+	uintptr_t base = stm32_rcc_base();
+
+	for (i = 0; i < count; i++)
+		io_clrsetbits32(base + cfg[i].offset,
+				GENMASK_32(cfg[i].bit_len - 1, 0),
+				cfg[i].value);
+
+	cfg = backup_mux4_cfg;
+	count = ARRAY_SIZE(backup_mux4_cfg);
+
+	for (i = 0; i < count; i++)
+		 io_clrsetbits32(base + cfg[i].offset,
+				 GENMASK_32(4 + cfg[i].bit_len - 1, 4),
+				 cfg[i].value);
+}
+
+/* Structure is used for set/clear registers and for regular registers */
+struct backup_clock_cfg {
+	uint32_t offset;
+	uint32_t value;
+};
+
+static struct backup_clock_cfg backup_clock_sc_cfg[] = {
+	{ .offset = RCC_MP_APB1ENSETR },
+	{ .offset = RCC_MP_APB2ENSETR },
+	{ .offset = RCC_MP_APB3ENSETR },
+	{ .offset = RCC_MP_APB4ENSETR },
+	{ .offset = RCC_MP_APB5ENSETR },
+	{ .offset = RCC_MP_AHB2ENSETR },
+	{ .offset = RCC_MP_AHB3ENSETR },
+	{ .offset = RCC_MP_AHB4ENSETR },
+	{ .offset = RCC_MP_AHB5ENSETR },
+	{ .offset = RCC_MP_AHB6ENSETR },
+	{ .offset = RCC_MP_MLAHBENSETR },
+};
+
+static struct backup_clock_cfg backup_clock_cfg[] = {
+	{ .offset = RCC_TZCR},
+	{ .offset = RCC_MCO1CFGR },
+	{ .offset = RCC_MCO2CFGR },
+	{ .offset = RCC_PLL3CR },
+	{ .offset = RCC_PLL4CR },
+	{ .offset = RCC_PLL4CFGR2 },
+	{ .offset = RCC_MCUDIVR },
+	{ .offset = RCC_MSSCKSELR },
+};
+
+static void backup_sc_cfg(void)
+{
+	struct backup_clock_cfg *cfg = backup_clock_sc_cfg;
+	size_t count = ARRAY_SIZE(backup_clock_sc_cfg);
+	size_t i = 0;
+	uintptr_t base = stm32_rcc_base();
+
+	for (i = 0; i < count; i++)
+		cfg[i].value = io_read32(base + cfg[i].offset);
+}
+
+static void restore_sc_cfg(void)
+{
+	struct backup_clock_cfg *cfg = backup_clock_sc_cfg;
+	size_t count = ARRAY_SIZE(backup_clock_sc_cfg);
+	size_t i = 0;
+	uintptr_t base = stm32_rcc_base();
+
+	for (i = 0; i < count; i++) {
+		io_write32(base + cfg[i].offset, cfg[i].value);
+		io_write32(base + cfg[i].offset + RCC_MP_ENCLRR_OFFSET,
+			   ~cfg[i].value);
+	}
+}
+
+static void backup_regular_cfg(void)
+{
+	struct backup_clock_cfg *cfg = backup_clock_cfg;
+	size_t count = ARRAY_SIZE(backup_clock_cfg);
+	size_t i = 0;
+	uintptr_t base = stm32_rcc_base();
+
+	for (i = 0; i < count; i++)
+		cfg[i].value = io_read32(base + cfg[i].offset);
+}
+
+static void restore_regular_cfg(void)
+{
+	struct backup_clock_cfg *cfg = backup_clock_cfg;
+	size_t count = ARRAY_SIZE(backup_clock_cfg);
+	size_t i = 0;
+	uintptr_t base = stm32_rcc_base();
+
+	for (i = 0; i < count; i++)
+		io_write32(base + cfg[i].offset, cfg[i].value);
+}
+
+static void disable_kernel_clocks(void)
+{
+	const uint32_t ker_mask = RCC_OCENR_HSIKERON |
+				  RCC_OCENR_CSIKERON |
+				  RCC_OCENR_HSEKERON;
+
+	/* Disable all ck_xxx_ker clocks */
+	io_write32(stm32_rcc_base() + RCC_OCENCLRR, ker_mask);
+}
+
+static void enable_kernel_clocks(void)
+{
+	uintptr_t rcc_base = stm32_rcc_base();
+	uint32_t reg = 0;
+	const uint32_t ker_mask = RCC_OCENR_HSIKERON |
+				  RCC_OCENR_CSIKERON |
+				  RCC_OCENR_HSEKERON;
+
+	/* Enable ck_xxx_ker clocks if ck_xxx was on */
+	reg = io_read32(rcc_base + RCC_OCENSETR) << 1;
+	io_write32(rcc_base + RCC_OCENSETR, reg & ker_mask);
+}
+
+static void clear_rcc_reset_status(void)
+{
+	/* Clear reset status fields */
+	io_write32(stm32_rcc_base() + RCC_MP_RSTSCLRR, 0);
+}
+
+void stm32mp1_clk_save_context_for_stop(void)
+{
+	enable_kernel_clocks();
+	save_mcu_subsys_clocks();
+	save_pll34_state();
+}
+
+void stm32mp1_clk_restore_context_for_stop(void)
+{
+	restore_pll34_state();
+	/* Restore MCU clock source after PLL3 is ready */
+	restore_mcu_subsys_clocks();
+	disable_kernel_clocks();
+}
+
+void stm32mp1_clk_mcuss_protect(bool enable)
+{
+	uintptr_t rcc_base = stm32_rcc_base();
+
+	if (enable)
+		io_setbits32(rcc_base + RCC_TZCR, RCC_TZCR_MCKPROT);
+	else
+		io_clrbits32(rcc_base + RCC_TZCR, RCC_TZCR_MCKPROT);
+}
+
+static void stm32_clock_suspend(void)
+{
+	backup_regular_cfg();
+	backup_sc_cfg();
+	backup_mux_cfg();
+	save_pll34_state();
+
+	enable_kernel_clocks();
+	clear_rcc_reset_status();
+}
+
+static void stm32_clock_resume(void)
+{
+	unsigned int idx = 0;
+
+	restore_pll34_state();
+	restore_mux_cfg();
+	restore_sc_cfg();
+	restore_regular_cfg();
+
+	/* Sync secure and shared clocks physical state on functional state */
+	for (idx = 0; idx < NB_GATES; idx++) {
+		struct stm32mp1_clk_gate const *gate = gate_ref(idx);
+
+		if (gate_is_non_secure(gate))
+			continue;
+
+		if (gate_refcounts[idx]) {
+			DMSG("Force clock %d enable", gate->clock_id);
+			__clk_enable(gate);
+		} else {
+			DMSG("Force clock %d disable", gate->clock_id);
+			__clk_disable(gate);
+		}
+	}
+
+	disable_kernel_clocks();
+}
+
+static TEE_Result stm32_clock_pm(enum pm_op op, unsigned int pm_hint __unused,
+				 const struct pm_callback_handle *hdl __unused)
+{
+	if (op == PM_OP_SUSPEND)
+		stm32_clock_suspend();
+	else
+		stm32_clock_resume();
 
 	return TEE_SUCCESS;
 }
+DECLARE_KEEP_PAGER(stm32_clock_pm);
+#else
+static TEE_Result stm32_clock_pm(enum pm_op op __unused,
+				 unsigned int pm_hint __unused,
+				 const struct pm_callback_handle *hdl __unused)
+{
+	return TEE_ERROR_SECURITY;
+}
+#endif /*CFG_PM*/
 
-service_init(stm32mp1_clk_early_init);
-#endif /*CFG_EMBED_DTB*/
+static void init_non_secure_rcc(void)
+{
+	uintptr_t rcc_base = stm32_rcc_base();
+
+	/*  Clear all interrupt flags and core stop requests */
+	io_write32(rcc_base + RCC_MP_CIFR, 0x110F1F);
+	io_write32(rcc_base + RCC_MP_SREQCLRR, 0x3);
+}
+
+static TEE_Result stm32_clk_probe(void)
+{
+	assert(PLLCFG_NB == PLAT_MAX_PLLCFG_NB);
+
+	stm32mp1_clk_early_init();
+	enable_static_secure_clocks();
+	save_current_opp();
+	init_non_secure_rcc();
+	register_pm_core_service_cb(stm32_clock_pm, NULL);
+
+	clk_provider_register(&stm32mp_clk_ops);
+
+	return TEE_SUCCESS;
+}
+/* Setup clock support before driver initialization */
+service_init(stm32_clk_probe);

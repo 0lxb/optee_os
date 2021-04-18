@@ -388,6 +388,7 @@ void core_mmu_set_discovered_nsec_ddr(struct core_mmu_phys_mem *start,
 			carve_out_phys_mem(&m, &num_elems, map->pa, map->size);
 			break;
 		case MEM_AREA_EXT_DT:
+		case MEM_AREA_RAM_NSEC:
 		case MEM_AREA_RES_VASPACE:
 		case MEM_AREA_SHM_VASPACE:
 		case MEM_AREA_TA_VASPACE:
@@ -490,7 +491,6 @@ static bool pbuf_is_sdp_mem(paddr_t pbuf __unused, size_t len __unused)
 
 /* Check special memories comply with registered memories */
 static void verify_special_mem_areas(struct tee_mmap_region *mem_map,
-				     size_t len,
 				     const struct core_mmu_phys_mem *start,
 				     const struct core_mmu_phys_mem *end,
 				     const char *area_name __maybe_unused)
@@ -498,7 +498,6 @@ static void verify_special_mem_areas(struct tee_mmap_region *mem_map,
 	const struct core_mmu_phys_mem *mem;
 	const struct core_mmu_phys_mem *mem2;
 	struct tee_mmap_region *mmap;
-	size_t n;
 
 	if (start == end) {
 		DMSG("No %s memory area defined", area_name);
@@ -524,9 +523,18 @@ static void verify_special_mem_areas(struct tee_mmap_region *mem_map,
 	/*
 	 * Check memories do not intersect any mapped memory.
 	 * This is called before reserved VA space is loaded in mem_map.
+	 *
+	 * Exceptions are the memory areas that maps with the same attributes
+	 * as for example MEM_AREA_RAM_NSEC and MEM_AREA_NSEC_SHM
+	 * which may overlap since they are used for the same purpose
+	 * except that MEM_AREA_NSEC_SHM is always mapped and
+	 * MEM_AREA_RAM_NSEC only uses a dynamic mapping.
 	 */
 	for (mem = start; mem < end; mem++) {
-		for (mmap = mem_map, n = 0; n < len; mmap++, n++) {
+		for (mmap = mem_map; mmap->type != MEM_AREA_END; mmap++) {
+			if (core_mmu_type_to_attr(mem->type) ==
+			    core_mmu_type_to_attr(mmap->type))
+				continue;
 			if (core_is_buffer_intersect(mem->addr, mem->size,
 						     mmap->pa, mmap->size)) {
 				MSG_MEM_INSTERSECT(mem->addr, mem->size,
@@ -650,6 +658,8 @@ uint32_t core_mmu_type_to_attr(enum teecore_memtypes t)
 	case MEM_AREA_RAM_SEC:
 	case MEM_AREA_SEC_RAM_OVERALL:
 		return attr | TEE_MATTR_SECURE | TEE_MATTR_PRW | cached;
+	case MEM_AREA_ROM_SEC:
+		return attr | TEE_MATTR_SECURE | TEE_MATTR_PR | cached;
 	case MEM_AREA_RES_VASPACE:
 	case MEM_AREA_SHM_VASPACE:
 		return 0;
@@ -841,8 +851,7 @@ static size_t collect_mem_ranges(struct tee_mmap_region *memory_map,
 	}
 
 	if (IS_ENABLED(CFG_SECURE_DATA_PATH))
-		verify_special_mem_areas(memory_map, num_elems,
-					 phys_sdp_mem_begin,
+		verify_special_mem_areas(memory_map, phys_sdp_mem_begin,
 					 phys_sdp_mem_end, "SDP");
 
 	add_va_space(memory_map, num_elems, MEM_AREA_RES_VASPACE,
@@ -1145,6 +1154,7 @@ static void check_mem_map(struct tee_mmap_region *map)
 		case MEM_AREA_IO_NSEC:
 		case MEM_AREA_EXT_DT:
 		case MEM_AREA_RAM_SEC:
+		case MEM_AREA_ROM_SEC:
 		case MEM_AREA_RAM_NSEC:
 		case MEM_AREA_RES_VASPACE:
 		case MEM_AREA_SHM_VASPACE:
@@ -1389,6 +1399,21 @@ void tlbi_mva_range(vaddr_t va, size_t size, size_t granule)
 		if (sz < granule)
 			break;
 		sz -= granule;
+		va += granule;
+	}
+	dsb_ish();
+	isb();
+}
+
+void tlbi_mva_range_asid(vaddr_t va, size_t len, size_t granule, uint32_t asid)
+{
+	assert(granule == CORE_MMU_PGDIR_SIZE || granule == SMALL_PAGE_SIZE);
+	assert(!(va & (granule - 1)) && !(len & (granule - 1)));
+
+	dsb_ishst();
+	while (len) {
+		tlbi_mva_asid_nosync(va, asid);
+		len -= granule;
 		va += granule;
 	}
 	dsb_ish();

@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 /*
- * Copyright (c) 2016, Linaro Limited
+ * Copyright (c) 2016-2019, Linaro Limited
  * Copyright (c) 2014, STMicroelectronics International N.V.
  */
 
@@ -162,6 +162,15 @@
 #define IDPFR1_VIRT_MASK             (0xF << IDPFR1_VIRT_SHIFT)
 #define IDPFR1_GENTIMER_SHIFT        16
 #define IDPFR1_GENTIMER_MASK         (0xF << IDPFR1_GENTIMER_SHIFT)
+
+/* Generic timer registers and fields */
+#define CNTCR_OFFSET		0x000
+#define CNTSR_OFFSET		0x004
+#define CNTCVL_OFFSET		0x008
+#define CNTCVU_OFFSET		0x00C
+#define CNTFID_OFFSET		0x020
+
+#define CNTCR_EN		BIT(0)
 
 #ifndef __ASSEMBLER__
 #include <generated/arm32_sysreg.h>

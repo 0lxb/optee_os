@@ -26,13 +26,17 @@ srcs-$(CFG_STM32_BSEC) += stm32_bsec.c
 srcs-$(CFG_STM32_ETZPC) += stm32_etzpc.c
 srcs-$(CFG_STM32_GPIO) += stm32_gpio.c
 srcs-$(CFG_STM32_I2C) += stm32_i2c.c
+srcs-$(CFG_STM32_IWDG) += stm32_iwdg.c
 srcs-$(CFG_STM32_RNG) += stm32_rng.c
+srcs-$(CFG_STM32_RTC) += stm32_rtc.c
+srcs-$(CFG_STM32_TIM) += stm32_tim.c
 srcs-$(CFG_STM32_UART) += stm32_uart.c
 srcs-$(CFG_STPMIC1) += stpmic1.c
 srcs-$(CFG_BCM_HWRNG) += bcm_hwrng.c
 srcs-$(CFG_BCM_SOTP) += bcm_sotp.c
 srcs-$(CFG_BCM_GPIO) += bcm_gpio.c
 
+subdirs-y += clk
 subdirs-y += crypto
 subdirs-$(CFG_BNXT_FW) += bnxt
 subdirs-$(CFG_SCMI_MSG_DRIVERS) += scmi-msg

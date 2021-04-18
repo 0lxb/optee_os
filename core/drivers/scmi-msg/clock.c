@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 /*
- * Copyright (c) 2015-2019, Arm Limited and Contributors. All rights reserved.
  * Copyright (c) 2019, Linaro Limited
+ * Copyright (c) 2015-2020, Arm Limited and Contributors. All rights reserved.
  */
 #include <assert.h>
 #include <confine_array_index.h>
@@ -357,7 +357,7 @@ static const scmi_msg_handler_t scmi_clock_handler_table[] = {
 	[SCMI_CLOCK_CONFIG_SET] = scmi_clock_config_set,
 };
 
-static bool message_id_is_supported(size_t message_id)
+static bool message_id_is_supported(unsigned int message_id)
 {
 	return message_id < ARRAY_SIZE(scmi_clock_handler_table) &&
 	       scmi_clock_handler_table[message_id];

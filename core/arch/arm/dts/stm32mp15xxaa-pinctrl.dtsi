@@ -79,6 +79,7 @@
 
 	gpioz: gpio@54004000 {
 		status = "okay";
+		secure-status = "okay";
 		ngpios = <8>;
 		gpio-ranges = <&pinctrl_z 0 400 8>;
 	};

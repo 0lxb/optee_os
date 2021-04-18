@@ -1,13 +1,11 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /*
- * Copyright (c) 2017-2018, STMicroelectronics
+ * Copyright (c) 2017-2020, STMicroelectronics
  */
 
 #ifndef __STM32MP1_RCC_H__
 #define __STM32MP1_RCC_H__
 
-#include <io.h>
-#include <stdbool.h>
 #include <util.h>
 
 #define RCC_TZCR			0x00
@@ -392,7 +390,8 @@
 #define RCC_HSICFGR_HSITRIM_SHIFT	8
 #define RCC_HSICFGR_HSITRIM_MASK	GENMASK_32(14, 8)
 #define RCC_HSICFGR_HSICAL_SHIFT	16
-#define RCC_HSICFGR_HSICAL_MASK		GENMASK_32(27, 16)
+#define RCC_HSICFGR_HSICAL_MASK		GENMASK_32(24, 16)
+#define RCC_HSICFGR_HSICAL_TEMP_MASK	GENMASK_32(27, 25)
 
 /* Fields of RCC_CSICFGR register */
 #define RCC_CSICFGR_CSITRIM_SHIFT	8
@@ -455,6 +454,9 @@
 #define RCC_MP_SREQCLRR_STPREQ_P0	BIT(0)
 #define RCC_MP_SREQCLRR_STPREQ_P1	BIT(1)
 
+/* Values of RCC_PWRLPDLYCR register */
+#define RCC_PWRLPDLYCR_PWRLP_DLY_MASK	GENMASK_32(21, 0)
+
 /* Global Control Register */
 #define RCC_MP_GCR_BOOT_MCU		BIT(0)
 
@@ -511,6 +513,9 @@
 #define RCC_AHB5RSTSETR_RNG1RST			BIT(6)
 #define RCC_AHB5RSTSETR_AXIMCRST		BIT(16)
 
+/* RCC_MP_AHB6RST(SET|CLR)R bit fields */
+#define RCC_AHB6RSTSETR_GPURST			BIT(5)
+
 /* RCC_MP_AHB5EN(SET|CLR)R bit fields */
 #define RCC_MP_AHB5ENSETR_GPIOZEN_POS		0
 #define RCC_MP_AHB5ENSETR_CRYP1EN_POS		4
@@ -534,26 +539,43 @@
 #define RCC_MP_AHB5LPENSETR_BKPSRAMLPEN		BIT(8)
 
 /* RCC_MP_TZAHB6EN(SET|CLR)R bit fields */
-#define RCC_MP_TZAHB6ENSETR_MDMA_POS	0
-#define RCC_MP_TZAHB6ENSETR_MDMA	BIT(RCC_MP_TZAHB6ENSETR_MDMA_POS)
+#define RCC_MP_TZAHB6ENSETR_MDMA_POS		0
+#define RCC_MP_TZAHB6ENSETR_MDMA		\
+					BIT(RCC_MP_TZAHB6ENSETR_MDMA_POS)
 
 /* RCC_MP_IWDGFZ(SET|CLR)R bit fields */
 #define RCC_MP_IWDGFZSETR_IWDG1			BIT(0)
 #define RCC_MP_IWDGFZSETR_IWDG2			BIT(1)
 
 #define DT_RCC_CLK_COMPAT	"st,stm32mp1-rcc"
+#define DT_RCC_SEC_CLK_COMPAT	"st,stm32mp1-rcc-secure"
 
 #ifndef __ASSEMBLER__
+#include <io.h>
+#include <stdbool.h>
+#include <types_ext.h>
+
 vaddr_t stm32_rcc_base(void);
 
 static inline bool stm32_rcc_is_secure(void)
 {
-	return io_read32(stm32_rcc_base() + RCC_TZCR) & RCC_TZCR_TZEN;
+	static int state = -1;
+
+	if (state < 0)
+		state = io_read32(stm32_rcc_base() + RCC_TZCR) & RCC_TZCR_TZEN;
+
+	return state;
 }
 
 static inline bool stm32_rcc_is_mckprot(void)
 {
-	return io_read32(stm32_rcc_base() + RCC_TZCR) & RCC_TZCR_MCKPROT;
+	const uint32_t mask = RCC_TZCR_TZEN | RCC_TZCR_MCKPROT;
+	static int state = -1;
+
+	if (state < 0)
+		state = (io_read32(stm32_rcc_base() + RCC_TZCR) & mask) == mask;
+
+	return state;
 }
 #endif /*__ASSEMBLER__*/
 

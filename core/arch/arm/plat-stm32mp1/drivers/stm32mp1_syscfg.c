@@ -5,6 +5,7 @@
 
 #include <dt-bindings/clock/stm32mp1-clks.h>
 #include <initcall.h>
+#include <drivers/clk.h>
 #include <kernel/delay.h>
 #include <mm/core_memprot.h>
 #include <stm32_util.h>
@@ -17,6 +18,7 @@
  */
 #define SYSCFG_CMPCR				0x20U
 #define SYSCFG_CMPENSETR			0x24U
+#define SYSCFG_CMPENCLRR			0x28U
 
 /*
  * SYSCFG_CMPCR Register
@@ -47,8 +49,8 @@ void stm32mp_syscfg_enable_io_compensation(void)
 	vaddr_t syscfg_base = get_syscfg_base();
 	uint64_t timeout_ref = 0;
 
-	stm32_clock_enable(CK_CSI);
-	stm32_clock_enable(SYSCFG);
+	clk_enable(CK_CSI);
+	clk_enable(SYSCFG);
 
 	io_setbits32(syscfg_base + SYSCFG_CMPENSETR, SYSCFG_CMPENSETR_MPU_EN);
 
@@ -71,6 +73,9 @@ void stm32mp_syscfg_disable_io_compensation(void)
 	vaddr_t syscfg_base = get_syscfg_base();
 	uint32_t value = 0;
 
+	 /* No refcount balance needed on non-secure SYSCFG clock */
+	clk_enable(SYSCFG);
+
 	value = io_read32(syscfg_base + SYSCFG_CMPCR) >>
 		SYSCFG_CMPCR_ANSRC_SHIFT;
 
@@ -84,10 +89,9 @@ void stm32mp_syscfg_disable_io_compensation(void)
 
 	DMSG("SYSCFG.cmpcr = %#"PRIx32, io_read32(syscfg_base + SYSCFG_CMPCR));
 
-	io_clrbits32(syscfg_base + SYSCFG_CMPENSETR, SYSCFG_CMPENSETR_MPU_EN);
+	io_setbits32(syscfg_base + SYSCFG_CMPENCLRR, SYSCFG_CMPENSETR_MPU_EN);
 
-	stm32_clock_disable(SYSCFG);
-	stm32_clock_disable(CK_CSI);
+	clk_disable(CK_CSI);
 }
 
 static TEE_Result stm32mp1_iocomp(void)

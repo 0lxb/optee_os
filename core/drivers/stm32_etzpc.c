@@ -26,10 +26,16 @@
 #include <kernel/pm.h>
 #include <libfdt.h>
 #include <mm/core_memprot.h>
+#include <stm32_util.h>
 #include <util.h>
 
 /* Devicetree compatibility */
 #define ETZPC_COMPAT			"st,stm32-etzpc"
+#define ETZPC_LOCK_MASK			BIT(0)
+#define ETZPC_MODE_SHIFT		8
+#define ETZPC_MODE_MASK			GENMASK_32(1, 0)
+#define ETZPC_ID_SHIFT			16
+#define ETZPC_ID_MASK			GENMASK_32(7, 0)
 
 /* ID Registers */
 #define ETZPC_TZMA0_SIZE		0x000U
@@ -316,6 +322,45 @@ void stm32_etzpc_init(paddr_t base)
 }
 
 #ifdef CFG_DT
+struct dt_id_attr {
+	/* The effective size of the array is meaningless here */
+	fdt32_t id_attr[1];
+};
+
+static void etzpc_dt_conf_decprot(void *fdt, int node)
+{
+	const struct dt_id_attr *conf_list = NULL;
+	size_t i = 0;
+	int len = 0;
+
+	conf_list = (const struct dt_id_attr *)fdt_getprop(fdt, node,
+							   "st,decprot", &len);
+	if (conf_list == NULL) {
+		DMSG("No ETZPC DECPROT configuration in DT");
+		return;
+	}
+
+	for (i = 0; i < len / sizeof(uint32_t); i++) {
+		uint32_t value = fdt32_to_cpu(conf_list->id_attr[i]);
+		uint32_t id = (value >> ETZPC_ID_SHIFT) & ETZPC_ID_MASK;
+		uint32_t mode = (value >> ETZPC_MODE_SHIFT) & ETZPC_MODE_MASK;
+		bool lock = value & ETZPC_LOCK_MASK;
+		enum etzpc_decprot_attributes attr = ETZPC_DECPROT_MAX;
+
+		if (!valid_decprot_id(id)) {
+			DMSG("Invalid DECPROT %"PRIu32, id);
+			panic();
+		}
+
+		attr = stm32mp_etzpc_binding2decprot(mode);
+		stm32mp_register_etzpc_decprot(id, attr);
+		etzpc_configure_decprot(id, attr);
+
+		if (lock)
+			etzpc_lock_decprot(id);
+	}
+}
+
 static TEE_Result init_etzpc_from_dt(void)
 {
 	void *fdt = get_embedded_dt();
@@ -338,6 +383,8 @@ static TEE_Result init_etzpc_from_dt(void)
 		panic();
 
 	init_device_from_hw_config(&etzpc_dev, pbase);
+
+	etzpc_dt_conf_decprot(fdt, node);
 
 	return TEE_SUCCESS;
 }

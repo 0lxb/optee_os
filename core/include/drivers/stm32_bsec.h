@@ -10,6 +10,12 @@
 #include <stdint.h>
 #include <tee_api.h>
 
+/* BSEC_DEBUG */
+#define BSEC_HDPEN			BIT(4)
+#define BSEC_SPIDEN			BIT(5)
+#define BSEC_SPINDEN			BIT(6)
+#define BSEC_DBGSWGEN			BIT(10)
+
 /*
  * Load OTP from SAFMEM and provide its value
  * @value: Output read value
@@ -147,4 +153,14 @@ TEE_Result stm32_bsec_otp_lock(uint32_t service);
  */
 bool stm32_bsec_nsec_can_access_otp(uint32_t otp_id);
 
+/*
+ * Find and get OTP location from its name.
+ * @name: sub-node name to look up.
+ * @otp_id: pointer to read OTP number or NULL.
+ * @otp_bit_len: pointer to read OTP length in bits or NULL.
+ * Return a TEE_Result compliant status
+ */
+TEE_Result stm32_bsec_find_otp_in_nvmem_layout(const char *name,
+					       uint32_t *otp_id,
+					       size_t *otp_bit_len);
 #endif /*__STM32_BSEC_H*/

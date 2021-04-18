@@ -25,6 +25,11 @@ struct itr_ops {
 		uint8_t cpu_mask);
 	void (*set_affinity)(struct itr_chip *chip, size_t it,
 		uint8_t cpu_mask);
+#if !defined(CFG_ARM_GICV3)
+	uint8_t (*set_pmr)(struct itr_chip *chip, uint8_t mask);
+	uint8_t (*set_ipriority)(struct itr_chip *chip, size_t it,
+					uint8_t mask);
+#endif
 };
 
 enum itr_return {
@@ -65,5 +70,15 @@ void itr_set_affinity(size_t it, uint8_t cpu_mask);
  * expects to receive secure interrupts should override this function.
  */
 void itr_core_handler(void);
+
+/*
+ * Set the Priority Mask Regarding and return its previous value
+ */
+uint8_t itr_set_pmr(uint8_t mask);
+
+/*
+ * Set the targe tinterrupt priority mask and return its previous value
+ */
+uint8_t itr_set_ipriority(size_t it, uint8_t mask);
 
 #endif /*__KERNEL_INTERRUPT_H*/

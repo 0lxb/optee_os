@@ -1,26 +1,35 @@
-/* SPDX-License-Identifier: GPL-2.0 or BSD-3-Clause */
 /*
- * Copyright (C) 2018-2019, STMicroelectronics
+ * Copyright (C) 2017, STMicroelectronics - All Rights Reserved
+ *
+ * SPDX-License-Identifier:	GPL-2.0+	BSD-3-Clause
  */
 
-#ifndef __STM32MP1_ETZPC_H
-#define __STM32MP1_ETZPC_H
+#ifndef _DT_BINDINGS_STM32_ETZPC_H
+#define _DT_BINDINGS_STM32_ETZPC_H
 
-/* Define DECPROT IDs for stm32mp1 familly */
+/*  define DECPROT modes */
+#define DECPROT_S_RW		0x0
+#define DECPROT_NS_R_S_W	0x1
+#define DECPROT_MCU_ISOLATION	0x2
+#define DECPROT_NS_RW		0x3
+
+/*  define DECPROT lock */
+#define DECPROT_UNLOCK		0x0
+#define DECPROT_LOCK		0x1
+
+/* define ETZPC ID */
 #define STM32MP1_ETZPC_STGENC_ID	0
 #define STM32MP1_ETZPC_BKPSRAM_ID	1
 #define STM32MP1_ETZPC_IWDG1_ID		2
 #define STM32MP1_ETZPC_USART1_ID	3
 #define STM32MP1_ETZPC_SPI6_ID		4
 #define STM32MP1_ETZPC_I2C4_ID		5
-#define STM32MP1_ETZPC_GPIOZ_ID		6
 #define STM32MP1_ETZPC_RNG1_ID		7
 #define STM32MP1_ETZPC_HASH1_ID		8
 #define STM32MP1_ETZPC_CRYP1_ID		9
 #define STM32MP1_ETZPC_DDRCTRL_ID	10
 #define STM32MP1_ETZPC_DDRPHYC_ID	11
 #define STM32MP1_ETZPC_I2C6_ID		12
-/* 13-15 Reserved */
 #define STM32MP1_ETZPC_TIM2_ID		16
 #define STM32MP1_ETZPC_TIM3_ID		17
 #define STM32MP1_ETZPC_TIM4_ID		18
@@ -47,12 +56,9 @@
 #define STM32MP1_ETZPC_DAC_ID		39
 #define STM32MP1_ETZPC_UART7_ID		40
 #define STM32MP1_ETZPC_UART8_ID		41
-/* 42-43 Reserved */
 #define STM32MP1_ETZPC_MDIOS_ID		44
-/* 45-47 Reserved */
 #define STM32MP1_ETZPC_TIM1_ID		48
 #define STM32MP1_ETZPC_TIM8_ID		49
-/* 50 Reserved */
 #define STM32MP1_ETZPC_USART6_ID	51
 #define STM32MP1_ETZPC_SPI1_ID		52
 #define STM32MP1_ETZPC_SPI4_ID		53
@@ -65,7 +71,6 @@
 #define STM32MP1_ETZPC_SAI3_ID		60
 #define STM32MP1_ETZPC_DFSDM_ID		61
 #define STM32MP1_ETZPC_TT_FDCAN_ID	62
-/* 63 Reserved */
 #define STM32MP1_ETZPC_LPTIM2_ID	64
 #define STM32MP1_ETZPC_LPTIM3_ID	65
 #define STM32MP1_ETZPC_LPTIM4_ID	66
@@ -78,7 +83,6 @@
 #define STM32MP1_ETZPC_HASH2_ID		73
 #define STM32MP1_ETZPC_RNG2_ID		74
 #define STM32MP1_ETZPC_CRYP2_ID		75
-/* 76-79 Reserved */
 #define STM32MP1_ETZPC_SRAM1_ID		80
 #define STM32MP1_ETZPC_SRAM2_ID		81
 #define STM32MP1_ETZPC_SRAM3_ID		82
@@ -94,7 +98,10 @@
 #define STM32MP1_ETZPC_QSPI_ID		92
 #define STM32MP1_ETZPC_DLYBQ_ID		93
 #define STM32MP1_ETZPC_ETH_ID		94
-/* 95 Reserved */
+
 #define STM32MP1_ETZPC_MAX_ID		96
 
-#endif /*__STM32MP1_ETZPC_H*/
+#define DECPROT(id, mode, lock)		(((id) << 16) | ((mode) << 8) | (lock))
+
+#endif /* _DT_BINDINGS_STM32_ETZPC_H */
+

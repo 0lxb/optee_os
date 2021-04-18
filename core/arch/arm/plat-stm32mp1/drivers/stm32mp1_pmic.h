@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /*
- * Copyright (c) 2017-2020, STMicroelectronics
+ * Copyright (c) 2017-2021, STMicroelectronics
  */
 
 #ifndef __STM32MP1_PMIC_H__
@@ -15,6 +15,7 @@ void stm32mp_get_pmic(void);
 void stm32mp_put_pmic(void);
 int stm32mp_dt_pmic_status(void);
 const char *stm32mp_pmic_get_cpu_supply_name(void);
+const char *stm32mp_pmic_get_usb_supply_name(void);
 #else
 static inline void stm32mp_pmic_apply_boot_on_config(void)
 {
@@ -40,6 +41,11 @@ static inline int stm32mp_dt_pmic_status(void)
 }
 
 static inline const char *stm32mp_pmic_get_cpu_supply_name(void)
+{
+	return NULL;
+}
+
+static inline const char *stm32mp_pmic_get_usb_supply_name(void)
 {
 	return NULL;
 }

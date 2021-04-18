@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: BSD-3-Clause
 /*
- * Copyright (c) 2018-2019, STMicroelectronics
+ * Copyright (c) 2018-2020, STMicroelectronics
  */
 
 #include <assert.h>
+#include <drivers/clk.h>
 #include <drivers/stm32_rng.h>
 #include <io.h>
 #include <kernel/delay.h>
@@ -129,7 +130,7 @@ static void gate_rng(bool enable, struct stm32_rng_instance *dev)
 	if (enable) {
 		/* incr_refcnt return non zero if resource shall be enabled */
 		if (incr_refcnt(&dev->refcount)) {
-			stm32_clock_enable(dev->clock);
+			clk_enable(dev->clock);
 			io_write32(rng_cr, 0);
 			io_write32(rng_cr, RNG_CR_RNGEN | RNG_CR_CED);
 		}
@@ -137,7 +138,7 @@ static void gate_rng(bool enable, struct stm32_rng_instance *dev)
 		/* decr_refcnt return non zero if resource shall be disabled */
 		if (decr_refcnt(&dev->refcount)) {
 			io_write32(rng_cr, 0);
-			stm32_clock_disable(dev->clock);
+			clk_disable(dev->clock);
 		}
 	}
 
